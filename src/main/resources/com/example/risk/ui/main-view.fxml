@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+<?import javafx.scene.text.Font?>
+
+<BorderPane xmlns:fx="http://javafx.com/fxml/1"
+            fx:controller="com.example.risk.ui.MainController"
+            prefWidth="1100" prefHeight="720"
+            style="-fx-background-color: #f4f4f4;">
+
+    <!-- ── Top bar ── -->
+    <top>
+        <HBox style="-fx-background-color: #2c3e50; -fx-padding: 12 16 12 16;" alignment="CENTER_LEFT">
+            <Label text="Historical VaR Computation System"
+                   style="-fx-text-fill: white; -fx-font-size: 16; -fx-font-weight: bold;"/>
+            <Region HBox.hgrow="ALWAYS"/>
+            <Label fx:id="statusLabel" text="Ready"
+                   style="-fx-text-fill: #aed6f1; -fx-font-size: 12;"/>
+        </HBox>
+    </top>
+
+    <!-- ── Left panel: configuration ── -->
+    <left>
+        <ScrollPane fitToWidth="true" style="-fx-background-color: #ecf0f1; -fx-min-width: 270;">
+            <VBox spacing="6" style="-fx-padding: 14; -fx-background-color: #ecf0f1;">
+
+                <Label text="DATA GENERATION" style="-fx-font-weight: bold; -fx-text-fill: #2c3e50;"/>
+
+                <Label text="Dataset ID:"/>
+                <TextField fx:id="datasetIdField" text="DATASET_001"/>
+
+                <Label text="Records:"/>
+                <TextField fx:id="numRecordsField" text="5000"/>
+
+                <Label text="Attributes:"/>
+                <TextField fx:id="numAttributesField" text="5"/>
+
+                <Label text="Attribute cardinality:"/>
+                <TextField fx:id="attrCardinalityField" text="8"/>
+
+                <Label text="Numbers vector length:"/>
+                <TextField fx:id="numbersLengthField" text="1000"/>
+
+                <Label text="Distribution:"/>
+                <ComboBox fx:id="distributionCombo" maxWidth="Infinity"/>
+
+                <Label text="Seed:"/>
+                <TextField fx:id="seedField" text="42"/>
+
+                <Button text="Generate &amp; Save to DB" fx:id="generateBtn"
+                        onAction="#onGenerate" maxWidth="Infinity"
+                        style="-fx-background-color: #27ae60; -fx-text-fill: white; -fx-font-weight: bold;"/>
+
+                <Separator/>
+
+                <Label text="QUERY" style="-fx-font-weight: bold; -fx-text-fill: #2c3e50;"/>
+
+                <Label text="Dataset ID to load:"/>
+                <HBox spacing="4">
+                    <ComboBox fx:id="datasetIdCombo" HBox.hgrow="ALWAYS" maxWidth="Infinity"/>
+                    <Button text="↺" fx:id="refreshDatasetsBtn" onAction="#onRefreshDatasets"
+                            style="-fx-font-size: 14;"/>
+                </HBox>
+
+                <Button text="Load from DB" fx:id="loadBtn"
+                        onAction="#onLoad" maxWidth="Infinity"
+                        style="-fx-background-color: #2980b9; -fx-text-fill: white;"/>
+
+                <Separator/>
+
+                <Label text="VAR PARAMETERS" style="-fx-font-weight: bold; -fx-text-fill: #2c3e50;"/>
+
+                <Label text="Interesting dims (e.g. 0,1,2):"/>
+                <TextField fx:id="interestingField" text="0,1,2"/>
+
+                <Label text="Percentiles (e.g. 1,95,99):"/>
+                <TextField fx:id="percentilesField" text="1.0,95.0,99.0"/>
+
+                <Label text="Aggregation strategy:"/>
+                <ComboBox fx:id="strategyCombo" maxWidth="Infinity"/>
+
+                <Separator/>
+
+                <Button text="Run VaR" fx:id="runVarBtn"
+                        onAction="#onRunVaR" maxWidth="Infinity"
+                        style="-fx-background-color: #8e44ad; -fx-text-fill: white; -fx-font-weight: bold;"/>
+
+                <Button text="Run Full Benchmark" fx:id="benchmarkBtn"
+                        onAction="#onBenchmark" maxWidth="Infinity"
+                        style="-fx-background-color: #e67e22; -fx-text-fill: white;"/>
+
+                <Button text="Clear Output" onAction="#onClear" maxWidth="Infinity"/>
+
+            </VBox>
+        </ScrollPane>
+    </left>
+
+    <!-- ── Centre: results ── -->
+    <center>
+        <VBox style="-fx-padding: 10 12 10 12;" spacing="6">
+            <Label text="Output" style="-fx-font-weight: bold; -fx-text-fill: #2c3e50;"/>
+            <TextArea fx:id="resultsArea"
+                      VBox.vgrow="ALWAYS"
+                      editable="false"
+                      wrapText="true"
+                      style="-fx-font-family: 'Courier New', monospace; -fx-font-size: 12;"/>
+        </VBox>
+    </center>
+
+</BorderPane>
