@@ -19,6 +19,9 @@ public class RiskApp extends Application {
 
     @Override
     public void start(Stage stage) throws Exception {
+        long maxHeap = Runtime.getRuntime().maxMemory() / (1024 * 1024);
+        System.out.println("Max heap: " + maxHeap + " MB");
+
         // Bootstrap service before UI starts
         AppConfig config = new AppConfig();
         service = new VaRService(config);

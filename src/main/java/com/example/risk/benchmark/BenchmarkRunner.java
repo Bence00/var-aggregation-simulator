@@ -9,15 +9,24 @@ public final class BenchmarkRunner {
 
     private BenchmarkRunner() {}
 
-    /** Run {@code task} and return elapsed milliseconds. */
+    /**
+     * Run {@code task} and return elapsed milliseconds.
+     *
+     * <p>Uses {@link System#nanoTime()} instead of {@code currentTimeMillis()} to avoid
+     * the ~15 ms OS-timer quantisation on Windows, which would round short operations to 0 ms.
+     */
     public static <T> TimedResult<T> time(Callable<T> task) {
-        long start = System.currentTimeMillis();
+        long start = System.nanoTime();
         try {
             T value = task.call();
-            return new TimedResult<>(value, System.currentTimeMillis() - start, null);
+            return new TimedResult<>(value, nanosToMs(System.nanoTime() - start), null);
         } catch (Exception e) {
-            return new TimedResult<>(null, System.currentTimeMillis() - start, e);
+            return new TimedResult<>(null, nanosToMs(System.nanoTime() - start), e);
         }
+    }
+
+    private static long nanosToMs(long nanos) {
+        return nanos / 1_000_000L;
     }
 
     /** Overload for void tasks (returns null value). */

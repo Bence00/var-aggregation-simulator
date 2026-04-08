@@ -81,6 +81,9 @@
                 <Label text="Aggregation strategy:"/>
                 <ComboBox fx:id="strategyCombo" maxWidth="Infinity"/>
 
+                <Label text="Selection algorithm:"/>
+                <ComboBox fx:id="calculatorCombo" maxWidth="Infinity"/>
+
                 <Separator/>
 
                 <Button text="Run VaR" fx:id="runVarBtn"

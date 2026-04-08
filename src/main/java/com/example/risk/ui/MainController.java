@@ -32,6 +32,7 @@ public class MainController {
 
     @FXML private ComboBox<String> datasetIdCombo;
     @FXML private ComboBox<String> strategyCombo;
+    @FXML private ComboBox<String> calculatorCombo;
     @FXML private TextField  interestingField;
     @FXML private TextField  percentilesField;
 
@@ -56,6 +57,9 @@ public class MainController {
 
         strategyCombo.setItems(FXCollections.observableList(new ArrayList<>(service.getStrategyNames())));
         strategyCombo.getSelectionModel().selectFirst();
+
+        calculatorCombo.setItems(FXCollections.observableList(new ArrayList<>(service.getCalculatorNames())));
+        calculatorCombo.getSelectionModel().selectFirst();
 
         onRefreshDatasets();
         append("System ready. Configure parameters on the left and click a button to start.");
@@ -120,14 +124,15 @@ public class MainController {
             setStatus("Parse error: " + e.getMessage());
             return;
         }
-        String strategy = strategyCombo.getValue();
+        String strategy   = strategyCombo.getValue();
+        String calculator = calculatorCombo.getValue();
         setAllButtons(false);
-        setStatus("Running VaR (" + strategy + ")...");
+        setStatus("Running VaR (" + strategy + " / " + calculator + ")...");
 
         runAsync(() -> {
-            long t0     = System.currentTimeMillis();
-            List<LevelResult> levels = service.runVaR(strategy, dims, percs, this::setStatusFromWorker);
-            long elapsed = System.currentTimeMillis() - t0;
+            long t0     = System.nanoTime();
+            List<LevelResult> levels = service.runVaR(strategy, calculator, dims, percs, this::setStatusFromWorker);
+            long elapsed = (System.nanoTime() - t0) / 1_000_000L;
 
             String output = formatVaRResults(levels, percs, elapsed);
             Platform.runLater(() -> {
@@ -151,18 +156,20 @@ public class MainController {
             setStatus("Parse error: " + e.getMessage());
             return;
         }
-        String strategy = strategyCombo.getValue();
+        String strategy   = strategyCombo.getValue();
+        String calculator = calculatorCombo.getValue();
         setAllButtons(false);
         setStatus("Running full benchmark...");
 
         runAsync(() -> {
-            BenchmarkResult r = service.runFullBenchmark(config, strategy, dims, percs, this::setStatusFromWorker);
+            BenchmarkResult r = service.runFullBenchmark(config, strategy, calculator, dims, percs, this::setStatusFromWorker);
             String msg = String.format(
                 """
                 ═══════ BENCHMARK RESULT ═══════
                 Records     : %d
                 Vector len  : %d
-                Strategy    : %s
+                Aggregation : %s
+                Selection   : %s
                 ────────────────────────────────
                 Generation  : %5d ms
                 DB insert   : %5d ms
@@ -173,7 +180,7 @@ public class MainController {
                 TOTAL       : %5d ms
                 ════════════════════════════════
                 """,
-                r.getRecordCount(), r.getNumbersLength(), r.getStrategyName(),
+                r.getRecordCount(), r.getNumbersLength(), strategy, calculator,
                 r.getGenerationMs(), r.getDbInsertMs(), r.getDbLoadMs(),
                 r.getAggregationMs(), r.getPercentileMs(), r.getTotalMs());
 

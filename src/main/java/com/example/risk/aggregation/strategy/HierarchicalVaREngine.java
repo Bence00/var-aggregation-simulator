@@ -1,6 +1,10 @@
 package com.example.risk.aggregation.strategy;
 
 import com.example.risk.aggregation.AggregationStrategy;
+import com.example.risk.aggregation.AllLevelsAggregationStrategy;
+import com.example.risk.aggregation.impl.PrefixRollupAggregationStrategy;
+import com.example.risk.aggregation.streaming.CollectingVaROutputSink;
+import com.example.risk.aggregation.streaming.StreamingHierarchicalVaREngine;
 import com.example.risk.model.GroupKey;
 import com.example.risk.model.LevelResult;
 import com.example.risk.model.RiskRecord;
@@ -13,24 +17,17 @@ import java.util.Map;
 import java.util.function.Consumer;
 
 /**
- * Drives the full hierarchical VaR computation:
+ * Drives the hierarchical VaR computation.
  *
- * <ol>
- *   <li>Leaf level: delegate to {@link AggregationStrategy} to group records
- *       by the full interesting vector and produce summed numbers vectors.</li>
- *   <li>Extract VaR percentiles at the leaf level.</li>
- *   <li>Roll up: remove the last dimension → merge sibling groups into parents
- *       by elementwise summation.</li>
- *   <li>Extract VaR at the parent level.</li>
- *   <li>Repeat until the interesting vector is empty (root).</li>
- * </ol>
+ * <p>For prefix-rollup aggregation this class now uses a true streaming engine:
+ * one live accumulator per level, exact percentile extraction when a group closes,
+ * and no materialization of full {@code Map<GroupKey, double[]>} hierarchies.
  *
- * <p>Space: at each step only the current level's groups are live; the previous
- * level is discarded after rollup (space-conservative variant — Part a of the problem).
+ * <p>The legacy map-based path remains for the other aggregation strategies.
  */
 public class HierarchicalVaREngine {
 
-    private final AggregationStrategy  strategy;
+    private final AggregationStrategy strategy;
     private final PercentileCalculator calculator;
     private final Consumer<String> progress;
 
@@ -41,25 +38,33 @@ public class HierarchicalVaREngine {
     public HierarchicalVaREngine(AggregationStrategy strategy,
                                  PercentileCalculator calculator,
                                  Consumer<String> progress) {
-        this.strategy   = strategy;
+        this.strategy = strategy;
         this.calculator = calculator;
-        this.progress   = progress == null ? ignored -> {} : progress;
+        this.progress = progress == null ? ignored -> {} : progress;
     }
 
-    /**
-     * Compute VaR at every hierarchy level.
-     *
-     * @param records     loaded records for a single datasetId
-     * @param interesting attribute indices to group by (ordered; last is removed first)
-     * @param percentiles target percentile values in [0, 100], e.g. [1.0, 95.0, 99.0]
-     * @return one {@link LevelResult} per level (leaf first, root last)
-     */
-    public List<LevelResult> compute(List<RiskRecord>  records,
-                                     List<Integer>     interesting,
-                                     List<Double>      percentiles) {
-
-        // ── Leaf level: initial grouping from raw records ──────────────
+    public List<LevelResult> compute(List<RiskRecord> records,
+                                     List<Integer> interesting,
+                                     List<Double> percentiles) {
         List<Integer> dims = new ArrayList<>(interesting);
+
+        if (strategy instanceof PrefixRollupAggregationStrategy) {
+            progress.accept(String.format(
+                    "Streaming prefix-rollup: aggregating and computing VaR across %d levels", dims.size() + 1));
+            CollectingVaROutputSink sink = new CollectingVaROutputSink(levelDimensions(dims));
+            StreamingHierarchicalVaREngine streamEngine =
+                    new StreamingHierarchicalVaREngine(calculator, progress);
+            streamEngine.processInMemory(records, dims, percentiles, sink);
+            return sink.toLevelResults();
+        }
+
+        if (strategy instanceof AllLevelsAggregationStrategy allLevels) {
+            progress.accept(String.format(
+                    "Prefix-rollup: aggregating all %d levels in one pass", dims.size() + 1));
+            List<Map<GroupKey, double[]>> allMaps = allLevels.aggregateAllLevels(records, dims);
+            return computeTimedAllLevels(allMaps, dims, percentiles).levels;
+        }
+
         progress.accept(String.format("Aggregating leaf level 1/%d: dims %s",
                 interesting.size() + 1, dims));
         Map<GroupKey, double[]> groups = strategy.aggregate(records, dims);
@@ -69,42 +74,85 @@ public class HierarchicalVaREngine {
     public List<LevelResult> computeFromGroups(Map<GroupKey, double[]> groups,
                                                List<Integer> interesting,
                                                List<Double> percentiles) {
+        return computeTimedFromGroups(groups, interesting, percentiles).levels;
+    }
+
+    public ComputeResult computeTimedFromGroups(Map<GroupKey, double[]> groups,
+                                                List<Integer> interesting,
+                                                List<Double> percentiles) {
         List<LevelResult> levels = new ArrayList<>();
         List<Integer> dims = new ArrayList<>(interesting);
         int totalLevels = interesting.size() + 1;
         int level = 1;
+        long rollupAggNs = 0L;
+        long percentileNs = 0L;
+
         progress.accept(String.format("Computing VaR level %d/%d: %s (%d groups)",
                 level, totalLevels, dimensionsLabel(dims), groups.size()));
+        long t0 = System.nanoTime();
         levels.add(buildLevel(dims, groups, percentiles));
+        percentileNs += System.nanoTime() - t0;
 
-        // ── Rollup levels: iteratively remove last dimension ───────────
         while (!dims.isEmpty()) {
             level++;
             progress.accept(String.format("Rolling up to level %d/%d: dropping dimension %d",
                     level, totalLevels, dims.get(dims.size() - 1)));
             dims = new ArrayList<>(dims.subList(0, dims.size() - 1));
-            groups = rollup(groups);                             // merge into parents
+
+            long t1 = System.nanoTime();
+            groups = rollup(groups);
+            rollupAggNs += System.nanoTime() - t1;
+
             progress.accept(String.format("Computing VaR level %d/%d: %s (%d groups)",
                     level, totalLevels, dimensionsLabel(dims), groups.size()));
-            levels.add(buildLevel(dims, groups, percentiles));  // extract VaR
-            // previous groups map is now unreferenced → eligible for GC
+            long t2 = System.nanoTime();
+            levels.add(buildLevel(dims, groups, percentiles));
+            percentileNs += System.nanoTime() - t2;
         }
 
         progress.accept(String.format("VaR aggregation complete: %d/%d levels", totalLevels, totalLevels));
-        return levels;
+        return new ComputeResult(levels, rollupAggNs / 1_000_000L, percentileNs / 1_000_000L);
     }
 
-    // ── Private helpers ────────────────────────────────────────────────
+    public ComputeResult computeTimedAllLevels(List<Map<GroupKey, double[]>> allMaps,
+                                               List<Integer> interesting,
+                                               List<Double> percentiles) {
+        List<LevelResult> levels = new ArrayList<>();
+        int n = interesting.size();
+        int totalLevels = n + 1;
+        long percentileNs = 0L;
 
-    /**
-     * Merge current-level groups into parent-level groups by dropping the last
-     * element of each group key and summing the numbers vectors.
-     */
+        for (int i = 0; i < allMaps.size(); i++) {
+            List<Integer> dimsAtLevel = new ArrayList<>(interesting.subList(0, n - i));
+            Map<GroupKey, double[]> map = allMaps.get(i);
+            progress.accept(String.format("Computing VaR level %d/%d: %s (%d groups)",
+                    i + 1, totalLevels, dimensionsLabel(dimsAtLevel), map.size()));
+            long t = System.nanoTime();
+            levels.add(buildLevel(dimsAtLevel, map, percentiles));
+            percentileNs += System.nanoTime() - t;
+        }
+
+        progress.accept(String.format("VaR aggregation complete: %d/%d levels", totalLevels, totalLevels));
+        return new ComputeResult(levels, 0L, percentileNs / 1_000_000L);
+    }
+
+    public static final class ComputeResult {
+        public final List<LevelResult> levels;
+        public final long rollupAggMs;
+        public final long percentileMs;
+
+        ComputeResult(List<LevelResult> levels, long rollupAggMs, long percentileMs) {
+            this.levels = levels;
+            this.rollupAggMs = rollupAggMs;
+            this.percentileMs = percentileMs;
+        }
+    }
+
     private static Map<GroupKey, double[]> rollup(Map<GroupKey, double[]> current) {
         Map<GroupKey, double[]> parent = new LinkedHashMap<>();
         for (Map.Entry<GroupKey, double[]> entry : current.entrySet()) {
             GroupKey parentKey = entry.getKey().withoutLast();
-            double[] existing  = parent.get(parentKey);
+            double[] existing = parent.get(parentKey);
             if (existing == null) {
                 parent.put(parentKey, entry.getValue().clone());
             } else {
@@ -114,10 +162,9 @@ public class HierarchicalVaREngine {
         return parent;
     }
 
-    /** Compute VaR for every group and assemble a LevelResult. */
-    private LevelResult buildLevel(List<Integer>          dims,
+    private LevelResult buildLevel(List<Integer> dims,
                                    Map<GroupKey, double[]> groups,
-                                   List<Double>           percentiles) {
+                                   List<Double> percentiles) {
         Map<GroupKey, Map<Double, Double>> varMap = new LinkedHashMap<>();
         for (Map.Entry<GroupKey, double[]> e : groups.entrySet()) {
             Map<Double, Double> pMap = new LinkedHashMap<>();
@@ -130,11 +177,20 @@ public class HierarchicalVaREngine {
     }
 
     private static void addInPlace(double[] target, double[] source) {
-        for (int i = 0; i < Math.min(target.length, source.length); i++)
+        for (int i = 0; i < Math.min(target.length, source.length); i++) {
             target[i] += source[i];
+        }
     }
 
     private static String dimensionsLabel(List<Integer> dims) {
         return dims.isEmpty() ? "root" : "dims " + dims;
+    }
+
+    private static List<List<Integer>> levelDimensions(List<Integer> interesting) {
+        List<List<Integer>> levels = new ArrayList<>(interesting.size() + 1);
+        for (int i = 0; i <= interesting.size(); i++) {
+            levels.add(List.copyOf(interesting.subList(0, interesting.size() - i)));
+        }
+        return levels;
     }
 }

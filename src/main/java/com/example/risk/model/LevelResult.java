@@ -23,9 +23,16 @@ public final class LevelResult {
     public LevelResult(List<Integer> dimensions,
                        Map<GroupKey, double[]> groups,
                        Map<GroupKey, Map<Double, Double>> varValues) {
+        this(dimensions, groups, varValues, groups == null ? varValues.size() : groups.size());
+    }
+
+    public LevelResult(List<Integer> dimensions,
+                       Map<GroupKey, double[]> groups,
+                       Map<GroupKey, Map<Double, Double>> varValues,
+                       int groupCount) {
         this.dimensions = dimensions;
         this.groups     = groups;
-        this.groupCount = groups == null ? varValues.size() : groups.size();
+        this.groupCount = groupCount;
         this.varValues  = varValues;
     }
 
