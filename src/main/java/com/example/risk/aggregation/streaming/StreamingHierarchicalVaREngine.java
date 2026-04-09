@@ -34,16 +34,19 @@ public class StreamingHierarchicalVaREngine {
                                                List<Integer> interesting,
                                                List<Double> percentiles,
                                                VaROutputSink sink) {
+        long orderingStart = System.nanoTime();
         List<RiskRecord> sorted = new ArrayList<>(records);
         sorted.sort(comparator(interesting));
-        return processOrderedSource(consumer -> {
+        long orderingMs = (System.nanoTime() - orderingStart) / 1_000_000L;
+        StreamComputeResult orderedResult = processOrderedSource(consumer -> {
             for (RiskRecord record : sorted) {
                 consumer.accept(record);
             }
         }, interesting, percentiles, sink);
+        return new StreamComputeResult(orderingMs, orderedResult.aggregationMs, orderedResult.percentileMs);
     }
 
-    public StreamComputeResult processOrderedSource(OrderedRecordSource source,
+    public StreamComputeResult processOrderedSource(OrderedRiskRecordSource source,
                                                     List<Integer> interesting,
                                                     List<Double> percentiles,
                                                     VaROutputSink sink) {
@@ -111,7 +114,7 @@ public class StreamingHierarchicalVaREngine {
         long percentileMs = percentileNs[0] / 1_000_000L;
         long aggregationMs = Math.max(0L, (totalNs - percentileNs[0]) / 1_000_000L);
         progress.accept(String.format("Streaming prefix-rollup complete: %d levels", totalLevels));
-        return new StreamComputeResult(aggregationMs, percentileMs);
+        return new StreamComputeResult(0L, aggregationMs, percentileMs);
     }
 
     private void closeGroup(int totalDims,
@@ -196,22 +199,15 @@ public class StreamingHierarchicalVaREngine {
     }
 
     public static final class StreamComputeResult {
+        public final long orderingMs;
         public final long aggregationMs;
         public final long percentileMs;
 
-        public StreamComputeResult(long aggregationMs, long percentileMs) {
+        public StreamComputeResult(long orderingMs, long aggregationMs, long percentileMs) {
+            this.orderingMs = orderingMs;
             this.aggregationMs = aggregationMs;
             this.percentileMs = percentileMs;
         }
     }
 
-    @FunctionalInterface
-    public interface OrderedRecordSource {
-        void forEach(RecordConsumer consumer) throws Exception;
-    }
-
-    @FunctionalInterface
-    public interface RecordConsumer {
-        void accept(RiskRecord record) throws Exception;
-    }
 }

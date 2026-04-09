@@ -27,6 +27,7 @@ public class MainController {
     @FXML private TextField  numAttributesField;
     @FXML private TextField  attrCardinalityField;
     @FXML private TextField  numbersLengthField;
+    @FXML private TextField  schemaArraySizeField;
     @FXML private ComboBox<String> distributionCombo;
     @FXML private TextField  seedField;
 
@@ -43,6 +44,8 @@ public class MainController {
     @FXML private Button     loadBtn;
     @FXML private Button     runVarBtn;
     @FXML private Button     benchmarkBtn;
+    @FXML private Button     queryBenchmarkBtn;
+    @FXML private Button     applySchemaBtn;
 
     private VaRService service;
 
@@ -60,6 +63,10 @@ public class MainController {
 
         calculatorCombo.setItems(FXCollections.observableList(new ArrayList<>(service.getCalculatorNames())));
         calculatorCombo.getSelectionModel().selectFirst();
+
+        if (schemaArraySizeField != null) {
+            schemaArraySizeField.setText(String.valueOf(service.getSchemaMaxAttributes()));
+        }
 
         onRefreshDatasets();
         append("System ready. Configure parameters on the left and click a button to start.");
@@ -104,6 +111,32 @@ public class MainController {
             Platform.runLater(() -> {
                 append(String.format("✓ Loaded %d records for '%s' in %dms", n, datasetId, ms));
                 setStatus("Loaded " + n + " records");
+                setAllButtons(true);
+            });
+        });
+    }
+
+    @FXML
+    public void onApplySchemaArraySize() {
+        int newSize;
+        try {
+            newSize = Integer.parseInt(schemaArraySizeField.getText().trim());
+        } catch (NumberFormatException e) {
+            setStatus("Invalid array size");
+            return;
+        }
+        if (newSize <= 0) {
+            setStatus("Array size must be positive");
+            return;
+        }
+
+        setAllButtons(false);
+        setStatus("Applying attribute array size: " + newSize);
+        runAsync(() -> {
+            service.updateSchemaMaxAttributes(newSize);
+            Platform.runLater(() -> {
+                append("Schema attribute array size set to " + newSize);
+                setStatus("Schema updated");
                 setAllButtons(true);
             });
         });
@@ -174,6 +207,7 @@ public class MainController {
                 Generation  : %5d ms
                 DB insert   : %5d ms
                 DB load     : %5d ms
+                Ordering    : %5d ms
                 Aggregation : %5d ms
                 Percentile  : %5d ms
                 ────────────────────────────────
@@ -182,12 +216,65 @@ public class MainController {
                 """,
                 r.getRecordCount(), r.getNumbersLength(), strategy, calculator,
                 r.getGenerationMs(), r.getDbInsertMs(), r.getDbLoadMs(),
-                r.getAggregationMs(), r.getPercentileMs(), r.getTotalMs());
+                r.getOrderingMs(), r.getAggregationMs(), r.getPercentileMs(), r.getTotalMs());
 
             Platform.runLater(() -> {
                 append(msg);
                 setStatus("Benchmark done. Total: " + r.getTotalMs() + "ms");
                 onRefreshDatasets();
+                setAllButtons(true);
+            });
+        });
+    }
+
+    @FXML
+    public void onQueryBenchmark() {
+        String datasetId = datasetIdCombo.getValue();
+        if (datasetId == null || datasetId.isBlank()) {
+            setStatus("Select a dataset first");
+            return;
+        }
+
+        List<Integer> dims;
+        List<Double> percs;
+        try {
+            dims = parseDims(interestingField.getText());
+            percs = parsePercentiles(percentilesField.getText());
+        } catch (Exception e) {
+            setStatus("Parse error: " + e.getMessage());
+            return;
+        }
+
+        String strategy = strategyCombo.getValue();
+        String calculator = calculatorCombo.getValue();
+        setAllButtons(false);
+        setStatus("Running query benchmark...");
+
+        runAsync(() -> {
+            BenchmarkResult r = service.runQueryBenchmark(datasetId, strategy, calculator, dims, percs, this::setStatusFromWorker);
+            String msg = String.format(
+                    """
+                    ═══════ QUERY BENCHMARK RESULT ═══════
+                    Dataset     : %s
+                    Records     : %d
+                    Vector len  : %d
+                    Aggregation : %s
+                    Selection   : %s
+                    ────────────────────────────────
+                    DB read     : %5d ms
+                    Ordering    : %5d ms
+                    Aggregation : %5d ms
+                    Percentile  : %5d ms
+                    ────────────────────────────────
+                    TOTAL       : %5d ms
+                    ════════════════════════════════
+                    """,
+                    datasetId, r.getRecordCount(), r.getNumbersLength(), strategy, calculator,
+                    r.getDbLoadMs(), r.getOrderingMs(), r.getAggregationMs(), r.getPercentileMs(), r.getTotalMs());
+
+            Platform.runLater(() -> {
+                append(msg);
+                setStatus("Query benchmark done. Total: " + r.getTotalMs() + "ms");
                 setAllButtons(true);
             });
         });
@@ -290,6 +377,8 @@ public class MainController {
         loadBtn.setDisable(!enabled);
         runVarBtn.setDisable(!enabled);
         benchmarkBtn.setDisable(!enabled);
+        if (queryBenchmarkBtn != null) queryBenchmarkBtn.setDisable(!enabled);
+        if (applySchemaBtn != null) applySchemaBtn.setDisable(!enabled);
     }
 
     private void runAsync(ThrowingRunnable task) {

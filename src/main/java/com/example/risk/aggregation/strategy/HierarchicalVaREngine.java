@@ -3,6 +3,7 @@ package com.example.risk.aggregation.strategy;
 import com.example.risk.aggregation.AggregationStrategy;
 import com.example.risk.aggregation.AllLevelsAggregationStrategy;
 import com.example.risk.aggregation.impl.PrefixRollupAggregationStrategy;
+import com.example.risk.aggregation.impl.PrefixStreamingAggregationStrategy;
 import com.example.risk.aggregation.streaming.CollectingVaROutputSink;
 import com.example.risk.aggregation.streaming.StreamingHierarchicalVaREngine;
 import com.example.risk.model.GroupKey;
@@ -48,7 +49,8 @@ public class HierarchicalVaREngine {
                                      List<Double> percentiles) {
         List<Integer> dims = new ArrayList<>(interesting);
 
-        if (strategy instanceof PrefixRollupAggregationStrategy) {
+        if (strategy instanceof PrefixRollupAggregationStrategy
+                || strategy instanceof PrefixStreamingAggregationStrategy) {
             progress.accept(String.format(
                     "Streaming prefix-rollup: aggregating and computing VaR across %d levels", dims.size() + 1));
             CollectingVaROutputSink sink = new CollectingVaROutputSink(levelDimensions(dims));

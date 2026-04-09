@@ -18,54 +18,43 @@ import java.util.List;
 import java.util.StringJoiner;
 
 /**
- * JDBC repository for risk_records table.
+ * JDBC repository for {@code risk_records}.
  *
- * <p>Uses PostgreSQL array types (TEXT[], FLOAT8[]) directly.
- * No ORM; all SQL is explicit so query plans are visible.
+ * <p>Attributes are stored as separate SQL columns ({@code attr1 .. attrN}) so ordered
+ * cursor reads can use plain {@code ORDER BY attrX, attrY, ...}. The Java model still
+ * reconstructs those columns as {@code List<String>} for the aggregation pipeline.
  */
 public class RecordRepository {
 
     private static final int COPY_CHUNK_SIZE = 500;
 
     private final AppConfig config;
+    private final int maxAttributes;
 
     public RecordRepository(AppConfig config) {
         this.config = config;
+        this.maxAttributes = config.getSchemaMaxAttributes();
     }
 
-    /** Create the table if it doesn't exist (idempotent). */
+    /** Create the table if it doesn't exist (non-destructive for the configured max attribute count). */
     public void ensureSchema() throws SQLException {
-        String sql = """
-                CREATE TABLE IF NOT EXISTS risk_records (
-                    id          BIGSERIAL           PRIMARY KEY,
-                    dataset_id  VARCHAR(255)        NOT NULL,
-                    attributes  TEXT[]              NOT NULL,
-                    numbers     DOUBLE PRECISION[]  NOT NULL,
-                    created_at  TIMESTAMP           NOT NULL DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_risk_records_dataset
-                    ON risk_records (dataset_id);
-                """;
         try (Connection conn = config.openConnection();
              Statement stmt = conn.createStatement()) {
-            stmt.execute(sql);
+            stmt.execute(schemaSql());
         }
     }
 
     /**
-     * Bulk-insert records using the PostgreSQL COPY protocol.
+     * Bulk-insert records using PostgreSQL COPY.
      *
-     * <p>The COPY payload is streamed through a lazy reader, so heap usage stays bounded
-     * by the current record text instead of a full chunk-sized String.
-     *
-     * @return number of records inserted
+     * <p>The payload is streamed lazily so heap usage is bounded by the current row text.
      */
     public int insertBatch(List<RiskRecord> records) throws SQLException {
         if (records.isEmpty()) {
             return 0;
         }
 
-        String copySql = "COPY risk_records (dataset_id, attributes, numbers) FROM STDIN";
+        String copySql = "COPY risk_records (" + insertColumnList() + ") FROM STDIN";
 
         try (Connection conn = config.openConnection()) {
             CopyManager mgr = new CopyManager(conn.unwrap(BaseConnection.class));
@@ -88,7 +77,6 @@ public class RecordRepository {
         }
     }
 
-    /** Delete all records for a dataset (used before re-generating). */
     public void deleteByDatasetId(String datasetId) throws SQLException {
         String sql = "DELETE FROM risk_records WHERE dataset_id = ?";
         try (Connection conn = config.openConnection();
@@ -100,13 +88,49 @@ public class RecordRepository {
 
     /** Load all records for a dataset into memory. */
     public List<RiskRecord> findByDatasetId(String datasetId) throws SQLException {
-        String sql = "SELECT id, dataset_id, attributes, numbers " +
-                "FROM risk_records WHERE dataset_id = ? ORDER BY id";
+        return findByDatasetId(datasetId, List.of());
+    }
+
+    /** Load all records for a dataset into memory with optional attribute ordering. */
+    public List<RiskRecord> findByDatasetId(String datasetId,
+                                            List<Integer> orderByAttributeIndices) throws SQLException {
+        StringBuilder sql = new StringBuilder("SELECT id, ").append(selectColumnList())
+                .append(" FROM risk_records WHERE dataset_id = ?");
+        if (orderByAttributeIndices != null && !orderByAttributeIndices.isEmpty()) {
+            StringJoiner joiner = new StringJoiner(", ");
+            for (int idx : orderByAttributeIndices) {
+                joiner.add(attributeColumn(idx));
+            }
+            sql.append(" ORDER BY ").append(joiner);
+        } else {
+            sql.append(" ORDER BY id");
+        }
+
+        List<RiskRecord> records = new ArrayList<>();
+        try (Connection conn = config.openConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql.toString())) {
+            stmt.setString(1, datasetId);
+            stmt.setFetchSize(1000);
+
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    records.add(mapRow(rs));
+                }
+            }
+        }
+        return records;
+    }
+
+    /** Load only a small sample of records for warmup or inspection. */
+    public List<RiskRecord> findSampleByDatasetId(String datasetId, int limit) throws SQLException {
+        String sql = "SELECT id, " + selectColumnList() +
+                " FROM risk_records WHERE dataset_id = ? ORDER BY id LIMIT ?";
         List<RiskRecord> records = new ArrayList<>();
         try (Connection conn = config.openConnection();
              PreparedStatement stmt = conn.prepareStatement(sql)) {
             stmt.setString(1, datasetId);
-            stmt.setFetchSize(1000);
+            stmt.setInt(2, limit);
+            stmt.setFetchSize(Math.max(1, limit));
 
             try (ResultSet rs = stmt.executeQuery()) {
                 while (rs.next()) {
@@ -121,18 +145,17 @@ public class RecordRepository {
      * Stream records for a dataset through a forward-only JDBC cursor.
      *
      * <p>If {@code orderByAttributeIndices} is non-empty, rows are ordered by those
-     * attribute positions using PostgreSQL's 1-based array indexing.
+     * attribute columns directly ({@code attr1}, {@code attr2}, ...).
      */
     public void forEachByDatasetId(String datasetId,
                                    List<Integer> orderByAttributeIndices,
                                    RecordConsumer consumer) throws SQLException {
-        StringBuilder sql = new StringBuilder(
-                "SELECT id, dataset_id, attributes, numbers FROM risk_records WHERE dataset_id = ?"
-        );
+        StringBuilder sql = new StringBuilder("SELECT id, ").append(selectColumnList())
+                .append(" FROM risk_records WHERE dataset_id = ?");
         if (orderByAttributeIndices != null && !orderByAttributeIndices.isEmpty()) {
             StringJoiner joiner = new StringJoiner(", ");
             for (int idx : orderByAttributeIndices) {
-                joiner.add("attributes[" + (idx + 1) + "]");
+                joiner.add(attributeColumn(idx));
             }
             sql.append(" ORDER BY ").append(joiner);
         } else {
@@ -153,7 +176,6 @@ public class RecordRepository {
         }
     }
 
-    /** Count records for a dataset without loading them. */
     public long countByDatasetId(String datasetId) throws SQLException {
         String sql = "SELECT COUNT(*) FROM risk_records WHERE dataset_id = ?";
         try (Connection conn = config.openConnection();
@@ -165,7 +187,25 @@ public class RecordRepository {
         }
     }
 
-    /** List all distinct dataset IDs in the table. */
+    public DatasetInfo getDatasetInfo(String datasetId) throws SQLException {
+        String sql = """
+                SELECT COUNT(*) AS record_count,
+                       COALESCE(MAX(array_length(numbers, 1)), 0) AS numbers_length
+                FROM risk_records
+                WHERE dataset_id = ?
+                """;
+        try (Connection conn = config.openConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setString(1, datasetId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (!rs.next()) {
+                    return new DatasetInfo(0, 0);
+                }
+                return new DatasetInfo(rs.getInt("record_count"), rs.getInt("numbers_length"));
+            }
+        }
+    }
+
     public List<String> listDatasetIds() throws SQLException {
         String sql = "SELECT DISTINCT dataset_id FROM risk_records ORDER BY dataset_id";
         List<String> ids = new ArrayList<>();
@@ -179,17 +219,76 @@ public class RecordRepository {
         return ids;
     }
 
-    private static RiskRecord mapRow(ResultSet rs) throws SQLException {
+    private RiskRecord mapRow(ResultSet rs) throws SQLException {
         RiskRecord r = new RiskRecord();
         r.setId(rs.getLong("id"));
         r.setDatasetId(rs.getString("dataset_id"));
 
-        String[] attrs = (String[]) rs.getArray("attributes").getArray();
-        r.setAttributes(Arrays.asList(attrs));
+        List<String> attrs = new ArrayList<>(maxAttributes);
+        for (int i = 0; i < maxAttributes; i++) {
+            String value = rs.getString(attributeColumn(i));
+            if (value == null) {
+                break;
+            }
+            attrs.add(value);
+        }
+        r.setAttributes(attrs);
 
         Double[] nums = (Double[]) rs.getArray("numbers").getArray();
         r.setNumbers(unboxed(nums));
         return r;
+    }
+
+    private String schemaSql() {
+        StringBuilder sql = new StringBuilder("""
+                CREATE TABLE IF NOT EXISTS risk_records (
+                    id          BIGSERIAL           PRIMARY KEY,
+                    dataset_id  VARCHAR(255)        NOT NULL,
+                    numbers     DOUBLE PRECISION[]  NOT NULL,
+                    created_at  TIMESTAMP           NOT NULL DEFAULT NOW()
+                );
+                """);
+        for (int i = 0; i < maxAttributes; i++) {
+            sql.append("ALTER TABLE risk_records ADD COLUMN IF NOT EXISTS ")
+                    .append(attributeColumn(i))
+                    .append(" VARCHAR(255);\n");
+        }
+        sql.append("""
+                CREATE INDEX IF NOT EXISTS idx_risk_records_dataset
+                    ON risk_records (dataset_id);
+                CREATE INDEX IF NOT EXISTS idx_risk_records_prefix
+                    ON risk_records (
+                        dataset_id
+                """);
+        for (int i = 0; i < maxAttributes; i++) {
+            sql.append(", ").append(attributeColumn(i));
+        }
+        sql.append("\n    );");
+        return sql.toString();
+    }
+
+    private String insertColumnList() {
+        StringJoiner joiner = new StringJoiner(", ");
+        joiner.add("dataset_id");
+        for (int i = 0; i < maxAttributes; i++) {
+            joiner.add(attributeColumn(i));
+        }
+        joiner.add("numbers");
+        return joiner.toString();
+    }
+
+    private String selectColumnList() {
+        StringJoiner joiner = new StringJoiner(", ");
+        joiner.add("dataset_id");
+        for (int i = 0; i < maxAttributes; i++) {
+            joiner.add(attributeColumn(i));
+        }
+        joiner.add("numbers");
+        return joiner.toString();
+    }
+
+    private static String attributeColumn(int zeroBasedIndex) {
+        return "attr" + (zeroBasedIndex + 1);
     }
 
     private static double[] unboxed(Double[] arr) {
@@ -200,22 +299,22 @@ public class RecordRepository {
         return out;
     }
 
-    private static String serializeRecord(RiskRecord record) {
-        StringBuilder sb = new StringBuilder();
-        sb.append(record.getDatasetId()).append('\t');
+    private String serializeRecord(RiskRecord record) {
+        validateAttributeCount(record);
 
-        sb.append('{');
+        StringBuilder sb = new StringBuilder();
+        appendCopyValue(sb, record.getDatasetId());
         List<String> attrs = record.getAttributes();
-        for (int i = 0; i < attrs.size(); i++) {
-            if (i > 0) {
-                sb.append(',');
+        for (int i = 0; i < maxAttributes; i++) {
+            sb.append('\t');
+            if (i < attrs.size()) {
+                appendCopyValue(sb, attrs.get(i));
+            } else {
+                sb.append("\\N");
             }
-            sb.append('"');
-            appendEscapedText(sb, attrs.get(i));
-            sb.append('"');
         }
 
-        sb.append("}\t{");
+        sb.append('\t').append('{');
         double[] nums = record.getNumbers();
         for (int i = 0; i < nums.length; i++) {
             if (i > 0) {
@@ -227,20 +326,38 @@ public class RecordRepository {
         return sb.toString();
     }
 
-    private static void appendEscapedText(StringBuilder sb, String value) {
-        for (int i = 0; i < value.length(); i++) {
-            char ch = value.charAt(i);
-            if (ch == '\\' || ch == '"') {
-                sb.append('\\');
-            }
-            sb.append(ch);
+    private void validateAttributeCount(RiskRecord record) {
+        if (record.getAttributes().size() > maxAttributes) {
+            throw new IllegalArgumentException(
+                    "Record has " + record.getAttributes().size()
+                            + " attributes but schema supports at most " + maxAttributes
+            );
         }
     }
 
-    /**
-     * Lazy COPY reader that emits one serialized record at a time.
-     */
-    private static final class CopyTextReader extends Reader {
+    private static void appendCopyValue(StringBuilder sb, String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            switch (ch) {
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                default:
+                    sb.append(ch);
+            }
+        }
+    }
+
+    private final class CopyTextReader extends Reader {
         private final List<RiskRecord> records;
         private final int to;
 
@@ -289,5 +406,23 @@ public class RecordRepository {
     @FunctionalInterface
     public interface RecordConsumer {
         void accept(RiskRecord record) throws SQLException;
+    }
+
+    public static final class DatasetInfo {
+        private final int recordCount;
+        private final int numbersLength;
+
+        public DatasetInfo(int recordCount, int numbersLength) {
+            this.recordCount = recordCount;
+            this.numbersLength = numbersLength;
+        }
+
+        public int recordCount() {
+            return recordCount;
+        }
+
+        public int numbersLength() {
+            return numbersLength;
+        }
     }
 }

@@ -14,6 +14,7 @@ import java.util.Properties;
 public class AppConfig {
 
     private final Properties props;
+    private Integer schemaMaxAttributesOverride;
 
     public AppConfig() {
         props = new Properties();
@@ -46,4 +47,17 @@ public class AppConfig {
     public long   getDefaultSeed()         { return Long.parseLong(props.getProperty("default.seed", "42")); }
     public String getDefaultPercentiles()  { return props.getProperty("default.percentiles", "1.0,95.0,99.0"); }
     public String getDefaultInteresting()  { return props.getProperty("default.interesting", "0,1,2"); }
+    public int    getSchemaMaxAttributes() {
+        if (schemaMaxAttributesOverride != null) {
+            return schemaMaxAttributesOverride;
+        }
+        return Integer.parseInt(props.getProperty("schema.max.attributes", "16"));
+    }
+
+    public void setSchemaMaxAttributes(int value) {
+        if (value <= 0) {
+            throw new IllegalArgumentException("schema.max.attributes must be positive");
+        }
+        schemaMaxAttributesOverride = value;
+    }
 }

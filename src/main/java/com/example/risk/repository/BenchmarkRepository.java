@@ -28,6 +28,7 @@ public class BenchmarkRepository {
                     generation_ms   BIGINT,
                     db_insert_ms    BIGINT,
                     db_load_ms      BIGINT,
+                    ordering_ms     BIGINT,
                     aggregation_ms  BIGINT,
                     percentile_ms   BIGINT,
                     total_ms        BIGINT,
@@ -37,6 +38,7 @@ public class BenchmarkRepository {
         try (Connection conn = config.openConnection();
              Statement stmt  = conn.createStatement()) {
             stmt.execute(sql);
+            stmt.execute("ALTER TABLE benchmark_results ADD COLUMN IF NOT EXISTS ordering_ms BIGINT");
         }
     }
 
@@ -44,8 +46,8 @@ public class BenchmarkRepository {
         String sql = """
                 INSERT INTO benchmark_results
                 (run_label, dataset_id, record_count, numbers_length, strategy_name,
-                 generation_ms, db_insert_ms, db_load_ms, aggregation_ms, percentile_ms, total_ms)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 generation_ms, db_insert_ms, db_load_ms, ordering_ms, aggregation_ms, percentile_ms, total_ms)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """;
         try (Connection conn = config.openConnection();
              PreparedStatement stmt = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
@@ -57,9 +59,10 @@ public class BenchmarkRepository {
             stmt.setLong  (6, r.getGenerationMs());
             stmt.setLong  (7, r.getDbInsertMs());
             stmt.setLong  (8, r.getDbLoadMs());
-            stmt.setLong  (9, r.getAggregationMs());
-            stmt.setLong  (10, r.getPercentileMs());
-            stmt.setLong  (11, r.getTotalMs());
+            stmt.setLong  (9, r.getOrderingMs());
+            stmt.setLong  (10, r.getAggregationMs());
+            stmt.setLong  (11, r.getPercentileMs());
+            stmt.setLong  (12, r.getTotalMs());
             stmt.executeUpdate();
         }
     }
@@ -88,6 +91,7 @@ public class BenchmarkRepository {
         r.setGenerationMs(rs.getLong("generation_ms"));
         r.setDbInsertMs(rs.getLong("db_insert_ms"));
         r.setDbLoadMs(rs.getLong("db_load_ms"));
+        r.setOrderingMs(rs.getLong("ordering_ms"));
         r.setAggregationMs(rs.getLong("aggregation_ms"));
         r.setPercentileMs(rs.getLong("percentile_ms"));
         r.setTotalMs(rs.getLong("total_ms"));

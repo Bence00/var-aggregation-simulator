@@ -16,6 +16,7 @@ public class BenchmarkResult {
     private long generationMs;
     private long dbInsertMs;
     private long dbLoadMs;
+    private long orderingMs;
     private long aggregationMs;
     private long percentileMs;
     private long totalMs;
@@ -49,6 +50,9 @@ public class BenchmarkResult {
     public long   getDbLoadMs()              { return dbLoadMs; }
     public void   setDbLoadMs(long v)        { this.dbLoadMs = v; }
 
+    public long   getOrderingMs()            { return orderingMs; }
+    public void   setOrderingMs(long v)      { this.orderingMs = v; }
+
     public long   getAggregationMs()         { return aggregationMs; }
     public void   setAggregationMs(long v)   { this.aggregationMs = v; }
 
@@ -61,8 +65,8 @@ public class BenchmarkResult {
     @Override
     public String toString() {
         return String.format(
-            "BenchmarkResult{label=%s, records=%d, n=%d, gen=%dms, insert=%dms, load=%dms, agg=%dms, pct=%dms, total=%dms}",
+            "BenchmarkResult{label=%s, records=%d, n=%d, gen=%dms, insert=%dms, load=%dms, order=%dms, agg=%dms, pct=%dms, total=%dms}",
             runLabel, recordCount, numbersLength,
-            generationMs, dbInsertMs, dbLoadMs, aggregationMs, percentileMs, totalMs);
+            generationMs, dbInsertMs, dbLoadMs, orderingMs, aggregationMs, percentileMs, totalMs);
     }
 }

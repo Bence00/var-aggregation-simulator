@@ -3,8 +3,12 @@ package com.example.risk.service;
 import com.example.risk.aggregation.AggregationStrategy;
 import com.example.risk.aggregation.impl.BaselineAggregationStrategy;
 import com.example.risk.aggregation.impl.PrefixRollupAggregationStrategy;
+import com.example.risk.aggregation.impl.PrefixStreamingAggregationStrategy;
 import com.example.risk.aggregation.impl.StreamingAggregationStrategy;
-import com.example.risk.aggregation.streaming.DiscardingVaROutputSink;
+import com.example.risk.aggregation.streaming.CollectingVaROutputSink;
+import com.example.risk.aggregation.streaming.CountingVaROutputSink;
+import com.example.risk.aggregation.streaming.OrderedRiskRecordSource;
+import com.example.risk.aggregation.streaming.StreamingAggregationResult;
 import com.example.risk.aggregation.streaming.StreamingHierarchicalVaREngine;
 import com.example.risk.aggregation.strategy.HierarchicalVaREngine;
 import com.example.risk.benchmark.BenchmarkRunner;
@@ -36,7 +40,7 @@ import java.util.function.Consumer;
 public class VaRService {
 
     private final AppConfig            config;
-    private final RecordRepository     recordRepo;
+    private RecordRepository           recordRepo;
     private final BenchmarkRepository  benchmarkRepo;
     private final SyntheticDataGenerator generator;
     private final PercentileCalculator calculator;
@@ -62,6 +66,7 @@ public class VaRService {
         strategies.put("Baseline (HashMap)",        new BaselineAggregationStrategy());
         strategies.put("Streaming (sort-merge)",    new StreamingAggregationStrategy());
         strategies.put("Prefix rollup (sort-scan)", new PrefixRollupAggregationStrategy());
+        strategies.put("Prefix streaming (DB ordered)", new PrefixStreamingAggregationStrategy());
 
         calculators = new LinkedHashMap<>();
         calculators.put("Sort-based (baseline)",           new SortBasedPercentileCalculator());
@@ -74,6 +79,16 @@ public class VaRService {
     public void initDatabase() throws SQLException {
         recordRepo.ensureSchema();
         benchmarkRepo.ensureSchema();
+    }
+
+    public int getSchemaMaxAttributes() {
+        return config.getSchemaMaxAttributes();
+    }
+
+    public void updateSchemaMaxAttributes(int value) throws SQLException {
+        config.setSchemaMaxAttributes(value);
+        this.recordRepo = new RecordRepository(config);
+        initDatabase();
     }
 
     // ── Queries ────────────────────────────────────────────────────────
@@ -179,6 +194,14 @@ public class VaRService {
         return runFullBenchmark(genConfig, strategyName, calculatorName, interestingDims, percentiles, ignored -> {});
     }
 
+    public BenchmarkResult runQueryBenchmark(String datasetId,
+                                             String strategyName,
+                                             String calculatorName,
+                                             List<Integer> interestingDims,
+                                             List<Double> percentiles) throws SQLException {
+        return runQueryBenchmark(datasetId, strategyName, calculatorName, interestingDims, percentiles, ignored -> {});
+    }
+
     public BenchmarkResult runFullBenchmark(GeneratorConfig  genConfig,
                                             String           strategyName,
                                             String           calculatorName,
@@ -192,96 +215,214 @@ public class VaRService {
         result.setNumbersLength(genConfig.getNumbersLength());
         result.setStrategyName(strategyName + " / " + calculatorName);
 
-        long totalStart = System.nanoTime();
-
-        List<RiskRecord> loaded;
         String datasetId = genConfig.getDatasetId();
-        if (matchesLoadedDataset(genConfig)) {
-            progress.accept("Benchmark: reusing already loaded dataset");
-            loaded = loadedRecords;
-            result.setGenerationMs(0L);
-            result.setDbInsertMs(0L);
-            result.setDbLoadMs(0L);
-        } else if (recordRepo.countByDatasetId(datasetId) == genConfig.getNumRecords()) {
-            progress.accept("Benchmark: loading existing dataset from database");
-            var loadT = BenchmarkRunner.time(() -> recordRepo.findByDatasetId(datasetId));
-            result.setDbLoadMs(loadT.elapsedMs);
-            loaded = loadT.unwrap();
-            loadedRecords = loaded;
-            loadedDatasetId = datasetId;
-            result.setGenerationMs(0L);
-            result.setDbInsertMs(0L);
-        } else {
-            // 1. Generate
-            progress.accept("Benchmark: generating records");
-            var genT = BenchmarkRunner.time(() -> generator.generate(genConfig));
-            result.setGenerationMs(genT.elapsedMs);
-            List<RiskRecord> records = genT.unwrap();
+        AggregationStrategy strategy = freshStrategy(strategyName);
+        PercentileCalculator calc = freshCalculator(calculatorName);
 
-            // 2. Insert
-            progress.accept("Benchmark: saving records to database");
-            recordRepo.deleteByDatasetId(datasetId);
-            var insT = BenchmarkRunner.time(() -> recordRepo.insertBatch(records));
-            result.setDbInsertMs(insT.elapsedMs);
-            insT.unwrap();
+        long generationNs;
+        long insertNs;
+        long loadNs;
+        long orderingNs;
+        long aggregationNs;
+        long percentileNs;
 
-            // 3. Load from DB (simulates production: load from kdb)
-            progress.accept("Benchmark: loading records from database");
-            var loadT = BenchmarkRunner.time(() -> recordRepo.findByDatasetId(datasetId));
-            result.setDbLoadMs(loadT.elapsedMs);
-            loaded = loadT.unwrap();
-            loadedRecords   = loaded;
-            loadedDatasetId = datasetId;
-        }
+        progress.accept("Benchmark: generating records");
+        long t0 = System.nanoTime();
+        List<RiskRecord> generated = generator.generate(genConfig);
+        generationNs = System.nanoTime() - t0;
 
-        // 4+5. Aggregate + percentile with properly split timings
-        AggregationStrategy  strategy = strategies.getOrDefault(strategyName,
-                new BaselineAggregationStrategy());
-        PercentileCalculator calc     = calculators.getOrDefault(calculatorName, calculator);
+        progress.accept("Benchmark: saving records to database");
+        recordRepo.deleteByDatasetId(datasetId);
+        long t1 = System.nanoTime();
+        recordRepo.insertBatch(generated);
+        insertNs = System.nanoTime() - t1;
 
-        // Warmup on a small in-memory subset so the JIT compiles hot paths before
-        // the timed DB-backed measurement begins.
-        progress.accept("Benchmark: warming up JIT...");
-        warmup(strategy, calc, loaded, interestingDims, percentiles);
-
-        // Release the full dataset before the realistic DB-backed benchmark path.
-        loaded = null;
+        // Ensure measured load is a fresh database read, not reused in-memory state.
+        generated = null;
         loadedRecords = new ArrayList<>();
         loadedDatasetId = "";
         System.gc();
 
+        List<RiskRecord> loaded = List.of();
+        if (strategy instanceof PrefixStreamingAggregationStrategy) {
+            progress.accept("Benchmark: warming up JIT...");
+            List<RiskRecord> warmupSample = recordRepo.findSampleByDatasetId(datasetId, 200);
+            warmup(new PrefixRollupAggregationStrategy(), freshCalculator(calculatorName), warmupSample, interestingDims, percentiles);
+            loadNs = 0L;
+        } else {
+            progress.accept("Benchmark: loading records from database");
+            long t2 = System.nanoTime();
+            loaded = recordRepo.findByDatasetId(datasetId);
+            loadNs = System.nanoTime() - t2;
+
+            progress.accept("Benchmark: warming up JIT...");
+            warmup(freshStrategy(strategyName), freshCalculator(calculatorName), loaded, interestingDims, percentiles);
+        }
+        System.gc();
+
         HierarchicalVaREngine engine = new HierarchicalVaREngine(strategy, calc, progress);
         if (strategy instanceof PrefixRollupAggregationStrategy) {
-            progress.accept("Benchmark: true streaming prefix aggregation from database");
+            progress.accept("Benchmark: ordering by interesting dimensions, then prefix-rollup");
             StreamingHierarchicalVaREngine streamingEngine =
                     new StreamingHierarchicalVaREngine(calc, progress);
-            BenchmarkRunner.TimedResult<StreamingHierarchicalVaREngine.StreamComputeResult> streamT =
-                    BenchmarkRunner.time(() -> streamingEngine.processOrderedSource(
-                            consumer -> recordRepo.forEachByDatasetId(datasetId, interestingDims, record -> {
-                                try {
-                                    consumer.accept(record);
-                                } catch (Exception e) {
-                                    throw new SQLException("Streaming record consumer failed", e);
-                                }
-                            }),
-                            interestingDims,
-                            percentiles,
-                            new DiscardingVaROutputSink()));
-            result.setDbLoadMs(0L);
-            StreamingHierarchicalVaREngine.StreamComputeResult computed = streamT.unwrap();
-            result.setAggregationMs(computed.aggregationMs);
-            result.setPercentileMs(computed.percentileMs);
+            CollectingVaROutputSink sink = new CollectingVaROutputSink(levelDimensions(interestingDims));
+            StreamingHierarchicalVaREngine.StreamComputeResult computed =
+                    streamingEngine.processInMemory(loaded, interestingDims, percentiles, sink);
+            orderingNs = computed.orderingMs * 1_000_000L;
+            aggregationNs = computed.aggregationMs * 1_000_000L;
+            percentileNs = computed.percentileMs * 1_000_000L;
+            List<LevelResult> levels = sink.toLevelResults();
+            emitBenchmarkDiagnostics(datasetId, loaded.size(), levels, generationNs, insertNs, loadNs, orderingNs, aggregationNs, percentileNs);
+        } else if (strategy instanceof PrefixStreamingAggregationStrategy streamingStrategy) {
+            progress.accept("Benchmark: ordered DB stream + prefix streaming rollup");
+            CountingVaROutputSink sink = new CountingVaROutputSink(interestingDims.size() + 1);
+            long t3 = System.nanoTime();
+            StreamingAggregationResult computed = streamingStrategy.computeOrdered(
+                    orderedDbSource(datasetId, interestingDims),
+                    interestingDims,
+                    percentiles,
+                    calc,
+                    sink,
+                    progress
+            );
+            orderingNs = computed.orderingMs() * 1_000_000L;
+            aggregationNs = computed.aggregationMs() * 1_000_000L;
+            percentileNs = computed.percentileMs() * 1_000_000L;
+            long streamTotalNs = System.nanoTime() - t3;
+            loadNs = Math.max(0L, streamTotalNs - orderingNs - aggregationNs - percentileNs);
+            emitBenchmarkDiagnostics(
+                    datasetId,
+                    genConfig.getNumRecords(),
+                    streamingLevels(interestingDims, sink.levelCounts()),
+                    generationNs,
+                    insertNs,
+                    loadNs,
+                    orderingNs,
+                    aggregationNs,
+                    percentileNs
+            );
         } else {
-            progress.accept("Benchmark: streaming leaf aggregation from database");
-            BenchmarkRunner.TimedResult<Map<GroupKey, double[]>> aggT =
-                    BenchmarkRunner.time(() -> aggregateLeafFromDb(datasetId, strategy, interestingDims));
-            result.setDbLoadMs(0L);
-            var computed = engine.computeTimedFromGroups(aggT.unwrap(), interestingDims, percentiles);
-            result.setAggregationMs(aggT.elapsedMs + computed.rollupAggMs);
-            result.setPercentileMs(computed.percentileMs);
+            orderingNs = 0L;
+            progress.accept(String.format("Benchmark: aggregating leaf level for %s", strategyName));
+            long t3 = System.nanoTime();
+            Map<GroupKey, double[]> groups = strategy.aggregate(loaded, interestingDims);
+            aggregationNs = System.nanoTime() - t3;
+
+            progress.accept("Benchmark: computing percentiles");
+            HierarchicalVaREngine.ComputeResult computed =
+                    engine.computeTimedFromGroups(groups, interestingDims, percentiles);
+            percentileNs = computed.percentileMs * 1_000_000L;
+            emitBenchmarkDiagnostics(datasetId, loaded.size(), computed.levels, generationNs, insertNs, loadNs, orderingNs, aggregationNs, percentileNs);
         }
 
-        result.setTotalMs((System.nanoTime() - totalStart) / 1_000_000L);
+        result.setGenerationMs(nanosToMs(generationNs));
+        result.setDbInsertMs(nanosToMs(insertNs));
+        result.setDbLoadMs(nanosToMs(loadNs));
+        result.setOrderingMs(nanosToMs(orderingNs));
+        result.setAggregationMs(nanosToMs(aggregationNs));
+        result.setPercentileMs(nanosToMs(percentileNs));
+
+        long stageTotalMs = result.getGenerationMs()
+                + result.getDbInsertMs()
+                + result.getDbLoadMs()
+                + result.getOrderingMs()
+                + result.getAggregationMs()
+                + result.getPercentileMs();
+        result.setTotalMs(stageTotalMs);
+        validateBenchmarkTotals(result);
+        saveBenchmark(result);
+        return result;
+    }
+
+    public BenchmarkResult runQueryBenchmark(String datasetId,
+                                             String strategyName,
+                                             String calculatorName,
+                                             List<Integer> interestingDims,
+                                             List<Double> percentiles,
+                                             Consumer<String> progress) throws SQLException {
+        BenchmarkResult result = new BenchmarkResult();
+        result.setRunLabel(timestamp() + " query benchmark");
+        result.setDatasetId(datasetId);
+        result.setStrategyName(strategyName + " / " + calculatorName + " [query]");
+
+        AggregationStrategy strategy = freshStrategy(strategyName);
+        PercentileCalculator calc = freshCalculator(calculatorName);
+
+        RecordRepository.DatasetInfo info = recordRepo.getDatasetInfo(datasetId);
+        if (info.recordCount() == 0) {
+            throw new IllegalStateException("Dataset not found or empty: " + datasetId);
+        }
+
+        result.setRecordCount(info.recordCount());
+        result.setNumbersLength(info.numbersLength());
+
+        progress.accept("Query benchmark: warming up JIT...");
+        List<RiskRecord> warmupSample = recordRepo.findSampleByDatasetId(datasetId, 200);
+        warmup(freshStrategy(strategyName), freshCalculator(calculatorName), warmupSample, interestingDims, percentiles);
+        System.gc();
+
+        HierarchicalVaREngine engine = new HierarchicalVaREngine(strategy, calc, progress);
+
+        long loadNs;
+        long orderingNs = 0L;
+        long aggregationNs;
+        long percentileNs;
+
+        progress.accept("Query benchmark: loading records from DB");
+        long t1 = System.nanoTime();
+        List<RiskRecord> loaded = loadRecordsForQueryBenchmark(datasetId, strategy, interestingDims);
+        loadNs = System.nanoTime() - t1;
+        emitQueryStageDebug(
+                datasetId,
+                strategyName,
+                "db-load",
+                loadNs,
+                "loadedRecords=" + loaded.size() + ", orderByInteresting=" + usesOrderedRead(strategy)
+        );
+
+        progress.accept("Query benchmark: leaf aggregation");
+        long t2 = System.nanoTime();
+        Map<GroupKey, double[]> groups = strategy.aggregate(loaded, interestingDims);
+        aggregationNs = System.nanoTime() - t2;
+        emitQueryStageDebug(
+                datasetId,
+                strategyName,
+                "aggregation",
+                aggregationNs,
+                "leafGroups=" + groups.size() + ", loadedRecords=" + loaded.size()
+        );
+
+        progress.accept("Query benchmark: percentile selection");
+        HierarchicalVaREngine.ComputeResult computed =
+                engine.computeTimedFromGroups(groups, interestingDims, percentiles);
+        percentileNs = computed.percentileMs * 1_000_000L;
+        int totalLevelGroups = (int) computed.levels.stream().mapToLong(LevelResult::getGroupCount).sum();
+        emitQueryStageDebug(
+                datasetId,
+                strategyName,
+                "percentile",
+                percentileNs,
+                "levels=" + computed.levels.size() + ", totalLevelGroups=" + totalLevelGroups
+        );
+        emitQueryDiagnostics(
+                datasetId,
+                info.recordCount(),
+                totalLevelGroups,
+                loadNs,
+                orderingNs,
+                aggregationNs,
+                percentileNs
+        );
+
+        result.setGenerationMs(0L);
+        result.setDbInsertMs(0L);
+        result.setDbLoadMs(nanosToMs(loadNs));
+        result.setOrderingMs(nanosToMs(orderingNs));
+        result.setAggregationMs(nanosToMs(aggregationNs));
+        result.setPercentileMs(nanosToMs(percentileNs));
+        result.setTotalMs(result.getDbLoadMs() + result.getOrderingMs() + result.getAggregationMs() + result.getPercentileMs());
+
+        validateBenchmarkTotals(result);
         saveBenchmark(result);
         return result;
     }
@@ -303,19 +444,47 @@ public class VaRService {
         engine.compute(subset, dims, percentiles);
     }
 
-    private boolean matchesLoadedDataset(GeneratorConfig config) {
-        if (!config.getDatasetId().equals(loadedDatasetId) || loadedRecords.isEmpty()) {
-            return false;
+    private AggregationStrategy freshStrategy(String strategyName) {
+        if ("Streaming (sort-merge)".equals(strategyName)) {
+            return new StreamingAggregationStrategy();
         }
-        if (loadedRecords.size() != config.getNumRecords()) {
-            return false;
+        if ("Prefix rollup (sort-scan)".equals(strategyName)) {
+            return new PrefixRollupAggregationStrategy();
         }
+        if ("Prefix streaming (DB ordered)".equals(strategyName)) {
+            return new PrefixStreamingAggregationStrategy();
+        }
+        return new BaselineAggregationStrategy();
+    }
 
-        RiskRecord first = loadedRecords.get(0);
-        return first.getAttributes() != null
-                && first.getAttributes().size() == config.getNumAttributes()
-                && first.getNumbers() != null
-                && first.getNumbers().length == config.getNumbersLength();
+    private PercentileCalculator freshCalculator(String calculatorName) {
+        if ("Floyd-Rivest SELECT".equals(calculatorName)) {
+            return new FloydRivestPercentileCalculator();
+        }
+        if ("OSILA (randomised order-statistic)".equals(calculatorName)) {
+            return new OsilaPercentileCalculator();
+        }
+        return new SortBasedPercentileCalculator();
+    }
+
+    private List<RiskRecord> loadRecordsForQueryBenchmark(String datasetId,
+                                                          AggregationStrategy strategy,
+                                                          List<Integer> dims) throws SQLException {
+        if (strategy instanceof StreamingAggregationStrategy
+                || strategy instanceof PrefixStreamingAggregationStrategy) {
+            return recordRepo.findByDatasetId(datasetId, dims);
+        }
+        return recordRepo.findByDatasetId(datasetId);
+    }
+
+    private OrderedRiskRecordSource orderedDbSource(String datasetId, List<Integer> interestingDims) {
+        return consumer -> recordRepo.forEachByDatasetId(datasetId, interestingDims, record -> {
+            try {
+                consumer.accept(record);
+            } catch (Exception e) {
+                throw new SQLException("Streaming record consumer failed", e);
+            }
+        });
     }
 
     private Map<GroupKey, double[]> aggregateLeafFromDb(String datasetId,
@@ -377,6 +546,109 @@ public class VaRService {
         for (int i = 0; i < len; i++) {
             target[i] += source[i];
         }
+    }
+
+    private static List<List<Integer>> levelDimensions(List<Integer> interesting) {
+        List<List<Integer>> levels = new ArrayList<>(interesting.size() + 1);
+        for (int i = 0; i <= interesting.size(); i++) {
+            levels.add(List.copyOf(interesting.subList(0, interesting.size() - i)));
+        }
+        return levels;
+    }
+
+    private static boolean usesOrderedRead(AggregationStrategy strategy) {
+        return strategy instanceof StreamingAggregationStrategy
+                || strategy instanceof PrefixStreamingAggregationStrategy;
+    }
+
+    private static List<LevelResult> streamingLevels(List<Integer> interesting, int[] groupCounts) {
+        List<LevelResult> levels = new ArrayList<>(groupCounts.length);
+        for (int i = 0; i < groupCounts.length; i++) {
+            List<Integer> dims = List.copyOf(interesting.subList(0, interesting.size() - i));
+            levels.add(new LevelResult(dims, null, Map.of(), groupCounts[i]));
+        }
+        return levels;
+    }
+
+    private void emitBenchmarkDiagnostics(String datasetId,
+                                          int processedRecords,
+                                          List<LevelResult> levels,
+                                          long generationNs,
+                                          long insertNs,
+                                          long loadNs,
+                                          long orderingNs,
+                                          long aggregationNs,
+                                          long percentileNs) {
+        long totalGroups = levels.stream().mapToLong(LevelResult::getGroupCount).sum();
+        System.out.printf(
+                "[BENCH] dataset=%s processedRecords=%d levels=%d groups=%d gen=%.3fms insert=%.3fms load=%.3fms order=%.3fms agg=%.3fms pct=%.3fms%n",
+                datasetId,
+                processedRecords,
+                levels.size(),
+                totalGroups,
+                generationNs / 1_000_000.0,
+                insertNs / 1_000_000.0,
+                loadNs / 1_000_000.0,
+                orderingNs / 1_000_000.0,
+                aggregationNs / 1_000_000.0,
+                percentileNs / 1_000_000.0
+        );
+    }
+
+    private void emitQueryDiagnostics(String datasetId,
+                                      int processedRecords,
+                                      int totalGroups,
+                                      long loadNs,
+                                      long orderingNs,
+                                      long aggregationNs,
+                                      long percentileNs) {
+        System.out.printf(
+                "[QUERY] dataset=%s processedRecords=%d groups=%d read=%.3fms order=%.3fms agg=%.3fms pct=%.3fms total=%.3fms%n",
+                datasetId,
+                processedRecords,
+                totalGroups,
+                loadNs / 1_000_000.0,
+                orderingNs / 1_000_000.0,
+                aggregationNs / 1_000_000.0,
+                percentileNs / 1_000_000.0,
+                (loadNs + orderingNs + aggregationNs + percentileNs) / 1_000_000.0
+        );
+    }
+
+    private void emitQueryStageDebug(String datasetId,
+                                     String strategyName,
+                                     String stage,
+                                     long elapsedNs,
+                                     String details) {
+        System.out.printf(
+                "[QUERY-STAGE] dataset=%s strategy=%s stage=%s elapsed=%.3fms %s%n",
+                datasetId,
+                strategyName,
+                stage,
+                elapsedNs / 1_000_000.0,
+                details
+        );
+    }
+
+    private void validateBenchmarkTotals(BenchmarkResult result) {
+        long stageSum = result.getGenerationMs()
+                + result.getDbInsertMs()
+                + result.getDbLoadMs()
+                + result.getOrderingMs()
+                + result.getAggregationMs()
+                + result.getPercentileMs();
+        if (result.getTotalMs() != stageSum) {
+            System.err.printf(
+                    "[WARN] Benchmark total mismatch for %s: total=%dms stageSum=%dms%n",
+                    result.getStrategyName(),
+                    result.getTotalMs(),
+                    stageSum
+            );
+        }
+    }
+
+    private static long nanosToMs(long nanos) {
+        return nanos / 1_000_000L;
     }
 
     private static final class GroupAccumulator {
